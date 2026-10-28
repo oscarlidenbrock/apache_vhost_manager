@@ -1,11 +1,21 @@
 import contextlib
+import importlib.util
 import io
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-import main
+
+MODULE_PATH = Path(__file__).with_name("vhost-manager.py")
+MODULE_SPEC = importlib.util.spec_from_file_location("vhost_manager", MODULE_PATH)
+if MODULE_SPEC is None or MODULE_SPEC.loader is None:
+    raise RuntimeError(f"Could not load {MODULE_PATH}")
+vhost_manager = importlib.util.module_from_spec(MODULE_SPEC)
+sys.modules[MODULE_SPEC.name] = vhost_manager
+MODULE_SPEC.loader.exec_module(vhost_manager)
 
 
 class VhostManagerTest(unittest.TestCase):
@@ -16,7 +26,9 @@ class VhostManagerTest(unittest.TestCase):
         self.vhosts = self.root / "httpd-vhosts.conf"
         self.certs = self.root / "certs"
         self.apachectl = self.root / "apachectl"
+        self.hosts = self.root / "hosts"
         self.vhosts.write_text("# Existing configuration\n", encoding="utf-8")
+        self.hosts.write_text("127.0.0.1 localhost\n", encoding="utf-8")
         self.apachectl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.apachectl.chmod(0o755)
         self.invoke(
@@ -28,6 +40,8 @@ class VhostManagerTest(unittest.TestCase):
             str(self.certs),
             "--apachectl",
             str(self.apachectl),
+            "--hosts-file",
+            str(self.hosts),
         )
 
     def tearDown(self):
@@ -36,7 +50,7 @@ class VhostManagerTest(unittest.TestCase):
     def invoke(self, *arguments):
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            status = main.main(["--config", str(self.config), *arguments])
+            status = vhost_manager.main(["--config", str(self.config), *arguments])
         self.assertEqual(status, 0, output.getvalue())
         return output.getvalue()
 
@@ -96,7 +110,7 @@ class VhostManagerTest(unittest.TestCase):
             encoding="utf-8",
         )
         with contextlib.redirect_stderr(io.StringIO()):
-            status = main.main(
+            status = vhost_manager.main(
                 [
                     "--config",
                     str(self.config),
@@ -124,6 +138,85 @@ class VhostManagerTest(unittest.TestCase):
         )
         self.assertTrue((self.certs / "generated.test.crt").is_file())
         self.assertTrue((self.certs / "generated.test.key").is_file())
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is not installed")
+    def test_ssl_vhost_generates_missing_certificate(self):
+        output = self.invoke(
+            "vhost",
+            "add",
+            "automatic.test",
+            "--document-root",
+            str(self.root / "automatic"),
+            "--alias",
+            "www.automatic.test",
+            "--ssl",
+        )
+
+        self.assertIn("Self-signed certificate generated", output)
+        self.assertTrue((self.certs / "automatic.test.crt").is_file())
+        self.assertTrue((self.certs / "automatic.test.key").is_file())
+        self.assertIn("SSLCertificateFile", self.vhosts.read_text(encoding="utf-8"))
+
+    @mock.patch(
+        "builtins.input",
+        side_effect=[
+            "interactive.test",
+            "/tmp/interactive",
+            "www.interactive.test",
+            "no",
+            "",
+            "",
+        ],
+    )
+    def test_new_vhost_prompts_for_missing_options(self, mocked_input):
+        self.invoke("vhost", "new")
+
+        content = self.vhosts.read_text(encoding="utf-8")
+        self.assertIn("ServerName interactive.test", content)
+        self.assertIn("ServerAlias www.interactive.test", content)
+        self.assertIn("<VirtualHost *:80>", content)
+        hosts = self.hosts.read_text(encoding="utf-8")
+        self.assertIn("127.0.0.1\tinteractive.test www.interactive.test", hosts)
+        self.assertEqual(mocked_input.call_count, 6)
+
+    def test_add_list_and_remove_host_mapping(self):
+        self.invoke(
+            "host",
+            "add",
+            "app.test",
+            "--alias",
+            "www.app.test",
+        )
+
+        self.assertIn("app.test", self.invoke("host", "list"))
+        hosts = self.hosts.read_text(encoding="utf-8")
+        self.assertIn("# BEGIN vhost-manager: app.test", hosts)
+        self.assertIn("127.0.0.1\tapp.test www.app.test", hosts)
+
+        self.invoke("host", "remove", "app.test")
+        self.assertNotIn("app.test", self.hosts.read_text(encoding="utf-8"))
+
+    def test_manual_host_mapping_prevents_vhost_creation(self):
+        self.hosts.write_text(
+            "127.0.0.1 localhost\n127.0.0.1 manual-host.test\n",
+            encoding="utf-8",
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            status = vhost_manager.main(
+                [
+                    "--config",
+                    str(self.config),
+                    "vhost",
+                    "add",
+                    "manual-host.test",
+                    "--document-root",
+                    str(self.root),
+                    "--map-host",
+                ]
+            )
+
+        self.assertEqual(status, 1)
+        self.assertNotIn("manual-host.test", self.vhosts.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
