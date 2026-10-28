@@ -4,19 +4,26 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import ipaddress
 import json
 import os
 import re
+import secrets
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import unquote, urlparse
 
 
 APP_NAME = "vhost-manager"
@@ -39,6 +46,19 @@ class Settings:
     certs_dir: Path
     apachectl: Path
     hosts_file: Path
+
+
+@dataclass(frozen=True)
+class VhostRecord:
+    """A VirtualHost entry ready to be displayed by the graphical interface."""
+
+    name: str
+    document_root: str
+    aliases: tuple[str, ...]
+    port: int
+    ssl: bool
+    cert_name: str
+    managed: bool
 
 
 def default_config_path() -> Path:
@@ -176,6 +196,55 @@ def directive(body: str, name: str) -> str | None:
     return match.group(1).strip('"') if match else None
 
 
+def directives(body: str, name: str) -> list[str]:
+    return [
+        match.group(1).strip().strip('"')
+        for match in re.finditer(
+            rf"^\s*{re.escape(name)}\s+(.+?)\s*$",
+            body,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    ]
+
+
+def parse_listen_port(listen: str, ssl: bool) -> int:
+    match = re.search(r":(\d+)\s*$", listen.strip())
+    if not match:
+        return 443 if ssl else 80
+    port = int(match.group(1))
+    return port if 1 <= port <= 65535 else (443 if ssl else 80)
+
+
+def parse_vhosts(content: str) -> list[VhostRecord]:
+    """Parse both managed and hand-written vhosts without changing the file."""
+
+    records: list[VhostRecord] = []
+    for match in VHOST_RE.finditer(content):
+        body = match.group("body")
+        name = directive(body, "ServerName") or "(sin ServerName)"
+        ssl = (directive(body, "SSLEngine") or "").lower() == "on"
+        cert_path = directive(body, "SSLCertificateFile") or ""
+        cert_name = Path(cert_path).stem if cert_path else name
+        managed = False
+        if name != "(sin ServerName)":
+            managed = any(
+                block.start() <= match.start() and block.end() >= match.end()
+                for block in managed_block_pattern(name).finditer(content)
+            )
+        records.append(
+            VhostRecord(
+                name=name,
+                document_root=directive(body, "DocumentRoot") or "",
+                aliases=tuple(directives(body, "ServerAlias")),
+                port=parse_listen_port(match.group("listen"), ssl),
+                ssl=ssl,
+                cert_name=cert_name,
+                managed=managed,
+            )
+        )
+    return records
+
+
 def read_vhosts_file(settings: Settings) -> str:
     try:
         return settings.vhosts_file.read_text(encoding="utf-8")
@@ -214,6 +283,8 @@ def atomic_write(path: Path, content: str) -> None:
 def update_file(path: Path, old: str, new: str) -> Path:
     if old == new:
         raise VhostManagerError("There are no changes to save.")
+    if not os.access(path, os.W_OK) or not os.access(path.parent, os.W_OK):
+        return privileged_update_file(path, old, new)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     backup = path.with_name(f"{path.name}.bak-{timestamp}")
     try:
@@ -225,6 +296,72 @@ def update_file(path: Path, old: str, new: str) -> Path:
     except Exception:
         shutil.copy2(backup, path)
         raise
+    return backup
+
+
+def privileged_update_file(path: Path, old: str, new: str) -> Path:
+    """Install a protected file after requesting macOS administrator approval."""
+
+    if sys.platform != "darwin":
+        raise VhostManagerError(
+            f"No permission to write {path}. Run the operation with suitable privileges."
+        )
+    osascript = Path("/usr/bin/osascript")
+    installer = Path("/usr/bin/install")
+    if not osascript.is_file() or not installer.is_file():
+        raise VhostManagerError(f"No permission to write {path}.")
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup_dir = default_config_path().parent / "backups"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / f"{path.name}.bak-{timestamp}"
+        backup.write_text(old, encoding="utf-8")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=backup_dir
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(new)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        staged = Path(temporary_name)
+        staged.chmod(mode)
+    except OSError as exc:
+        raise VhostManagerError(
+            f"Could not prepare the authorized update for {path}: {exc}"
+        ) from exc
+
+    command = " ".join(
+        (
+            shlex.quote(str(installer)),
+            "-m",
+            shlex.quote(f"{mode:o}"),
+            shlex.quote(str(staged)),
+            shlex.quote(str(path)),
+        )
+    )
+    apple_command = command.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'do shell script "{apple_command}" with administrator privileges'
+    try:
+        result = subprocess.run(
+            [str(osascript), "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        staged.unlink(missing_ok=True)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        if "canceled" in detail.lower() or "cancelled" in detail.lower():
+            detail = "Authorization was cancelled."
+        raise VhostManagerError(detail or f"Could not write {path}.")
+    try:
+        if path.read_text(encoding="utf-8") != new:
+            raise VhostManagerError(f"The authorized update of {path} was not applied.")
+    except OSError as exc:
+        raise VhostManagerError(f"Could not verify {path}: {exc}") from exc
     return backup
 
 
@@ -346,6 +483,14 @@ def host_remove(args: argparse.Namespace, settings: Settings) -> None:
     new_content = (content[: match.start()] + content[match.end() :]).rstrip() + "\n"
     backup = update_file(settings.hosts_file, content, new_content)
     print(f"Hosts entry for {name} removed. Backup: {backup}")
+
+
+def has_managed_host_mapping(settings: Settings, name: str) -> bool:
+    """Return whether /etc/hosts contains a block managed for this server name."""
+
+    if not NAME_RE.fullmatch(name):
+        return False
+    return managed_block_pattern(name).search(read_hosts_file(settings)) is not None
 
 
 def render_vhost(args: argparse.Namespace, settings: Settings) -> str:
@@ -664,6 +809,717 @@ def cert_remove(args: argparse.Namespace, settings: Settings) -> None:
     print(f"Certificate {args.name} removed.")
 
 
+def launch_web_gui(config_path: Path, config: dict[str, str]) -> None:
+    """Serve the graphical manager locally and open it in the default browser."""
+
+    token = secrets.token_urlsafe(24)
+    html = r"""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Vhost Manager</title>
+  <style>
+    :root { color-scheme: light; --bg:#f4f5f7; --panel:#fff; --line:#dfe3e8;
+      --text:#18202a; --muted:#667085; --blue:#1769e0; --danger:#b42318; }
+    * { box-sizing:border-box } body { margin:0; font:14px -apple-system,BlinkMacSystemFont,
+      "Segoe UI",sans-serif; color:var(--text); background:var(--bg) }
+    header { height:68px; display:flex; align-items:center; justify-content:space-between;
+      padding:0 28px; background:#111827; color:#fff }
+    header h1 { margin:0; font-size:21px } header span { color:#aeb8c7; font-size:12px }
+    main { max-width:1400px; margin:24px auto; padding:0 24px; display:grid;
+      grid-template-columns:minmax(520px,1.55fr) minmax(360px,1fr); gap:20px }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+      box-shadow:0 4px 14px rgba(16,24,40,.05); overflow:hidden }
+    .panel-title { display:flex; align-items:center; justify-content:space-between;
+      padding:18px 20px; border-bottom:1px solid var(--line) }
+    .panel-title h2 { margin:0; font-size:16px } button { border:0; border-radius:7px;
+      padding:9px 13px; font-weight:600; cursor:pointer; background:#e9edf3; color:#253044 }
+    button.primary { background:var(--blue); color:#fff } button.danger { color:var(--danger);
+      background:#feeceb } button:disabled { opacity:.45; cursor:not-allowed }
+    .table-wrap { overflow:auto; min-height:420px } table { border-collapse:collapse; width:100% }
+    th { text-align:left; padding:11px 14px; font-size:11px; text-transform:uppercase;
+      letter-spacing:.05em; color:var(--muted); background:#fafbfc; border-bottom:1px solid var(--line) }
+    td { padding:13px 14px; border-bottom:1px solid #edf0f3; white-space:nowrap }
+    tr[data-id] { cursor:pointer } tr[data-id]:hover, tr.selected { background:#eef5ff }
+    td.root { max-width:280px; overflow:hidden; text-overflow:ellipsis }
+    .badge { display:inline-block; padding:3px 7px; border-radius:10px; font-size:11px;
+      background:#e9edf3; color:#475467 }.badge.managed { background:#e8f7ee; color:#18794e }
+    form { padding:20px } label { display:block; margin-bottom:14px; color:#475467;
+      font-size:12px; font-weight:600 } input { display:block; width:100%; margin-top:6px;
+      border:1px solid #cfd6df; border-radius:7px; padding:10px 11px; font:inherit; color:var(--text) }
+    input:focus { outline:2px solid #b9d3ff; border-color:var(--blue) }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px }
+    .check { display:flex; align-items:center; gap:8px; font-size:13px; font-weight:500 }
+    .check input { width:auto; margin:0 }.actions { display:flex; gap:9px; margin-top:20px }
+    .actions .danger { margin-left:auto }.notice { min-height:38px; margin:2px 0 12px;
+      padding:10px 12px; border-radius:7px; background:#f5f7fa; color:var(--muted); font-size:12px }
+    #status { padding:12px 20px; border-top:1px solid var(--line); color:var(--muted); font-size:12px }
+    #toast { position:fixed; right:24px; bottom:24px; padding:12px 16px; border-radius:8px;
+      color:#fff; background:#223046; box-shadow:0 6px 20px #0003; opacity:0;
+      transform:translateY(10px); transition:.2s; pointer-events:none }
+    #toast.show { opacity:1; transform:none } #toast.error { background:#b42318 }
+    @media(max-width:900px) { main { grid-template-columns:1fr } }
+  </style>
+</head>
+<body>
+<header><h1>Vhost Manager</h1><span>Gestión local de Apache</span></header>
+<main>
+  <section class="panel">
+    <div class="panel-title"><h2>Virtual hosts</h2><button id="refresh">Recargar</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Servidor</th><th>Puerto</th><th>SSL</th>
+      <th>Directorio</th><th>Tipo</th></tr></thead><tbody id="list"></tbody></table></div>
+    <div id="status">Cargando…</div>
+  </section>
+  <section class="panel">
+    <div class="panel-title"><h2 id="form-title">Nuevo vhost</h2><button id="new">Nuevo</button></div>
+    <form id="form">
+      <label>ServerName<input id="name" required placeholder="proyecto.test"></label>
+      <label>DocumentRoot<input id="document_root" required placeholder="/ruta/al/public"></label>
+      <label>Aliases, separados por comas<input id="aliases" placeholder="www.proyecto.test"></label>
+      <div class="row"><label>Puerto<input id="port" type="number" min="1" max="65535" value="80" required></label>
+        <label>Certificado<input id="cert_name" placeholder="proyecto.test" disabled></label></div>
+      <div class="row"><label class="check"><input id="ssl" type="checkbox"> Activar SSL</label>
+        <label class="check"><input id="map_host" type="checkbox" checked> Gestionar en /etc/hosts</label></div>
+      <div class="notice" id="notice">Completa los datos para crear un vhost gestionado.</div>
+      <div class="actions"><button class="primary" id="save" type="submit">Guardar</button>
+        <button class="danger" id="delete" type="button" disabled>Eliminar</button></div>
+    </form>
+  </section>
+</main><div id="toast"></div>
+<script>
+const TOKEN = __TOKEN__;
+let records = [], selected = null;
+const $ = id => document.getElementById(id);
+const fields = ['name','document_root','aliases','port','cert_name','ssl','map_host'];
+function toast(message, error=false) { const el=$('toast'); el.textContent=message;
+  el.className='show'+(error?' error':''); clearTimeout(el.timer);
+  el.timer=setTimeout(()=>el.className='',2800); }
+function esc(value) { const node=document.createElement('span'); node.textContent=value ?? ''; return node.innerHTML; }
+async function request(path, options={}) { options.headers={...(options.headers||{}),'X-Vhost-Token':TOKEN};
+  const response=await fetch(path,options); const data=await response.json();
+  if(!response.ok) throw new Error(data.error||'Error inesperado'); return data; }
+async function load() { try { const data=await request('/api/vhosts'); records=data.vhosts;
+    $('status').textContent=`${records.length} vhost(s) · ${data.path}`;
+    $('list').innerHTML=records.map((v,i)=>`<tr data-id="${i}"><td><strong>${esc(v.name)}</strong></td>
+      <td>${v.port}</td><td>${v.ssl?'Sí':'No'}</td><td class="root" title="${esc(v.document_root)}">${esc(v.document_root)}</td>
+      <td><span class="badge ${v.managed?'managed':''}">${v.managed?'Gestionado':'Manual'}</span></td></tr>`).join('');
+    document.querySelectorAll('tr[data-id]').forEach(row=>row.onclick=()=>select(Number(row.dataset.id)));
+    if(selected!==null) { const index=records.findIndex(v=>v.name===selected); index>=0?select(index):reset(); }
+  } catch(error) { $('status').textContent='Error: '+error.message; toast(error.message,true); } }
+function setDisabled(disabled) { fields.forEach(id=>$(id).disabled=disabled);
+  $('save').disabled=disabled; $('delete').disabled=disabled||selected===null; }
+function select(index) { const v=records[index]; selected=v.name;
+  document.querySelectorAll('tr[data-id]').forEach((r,i)=>r.classList.toggle('selected',i===index));
+  $('form-title').textContent=v.name; $('name').value=v.name; $('document_root').value=v.document_root;
+  $('aliases').value=v.aliases.join(', '); $('port').value=v.port; $('ssl').checked=v.ssl;
+  $('cert_name').value=v.cert_name; $('map_host').checked=v.host_mapped; setDisabled(!v.managed);
+  if(v.managed) { $('save').textContent='Guardar'; $('name').disabled=true; $('cert_name').disabled=!v.ssl;
+    $('notice').textContent='Al guardar se creará una copia de respaldo.'; }
+  else { $('map_host').disabled=false; $('save').disabled=false; $('save').textContent='Guardar hosts';
+    $('notice').textContent='Vhost manual: solo puedes gestionar su entrada en /etc/hosts.'; } }
+function reset() { selected=null; $('form').reset(); $('port').value=80; $('map_host').checked=true;
+  $('form-title').textContent='Nuevo vhost'; setDisabled(false); $('cert_name').disabled=true;
+  $('save').textContent='Guardar'; $('delete').disabled=true; $('notice').textContent='Completa los datos para crear un vhost gestionado.';
+  document.querySelectorAll('tr.selected').forEach(r=>r.classList.remove('selected')); }
+$('ssl').onchange=()=>{ $('cert_name').disabled=!$('ssl').checked;
+  if($('ssl').checked&&!$('cert_name').value) $('cert_name').value=$('name').value; };
+$('new').onclick=reset; $('refresh').onclick=load;
+$('form').onsubmit=async event=>{ event.preventDefault(); const body={original_name:selected,
+  name:$('name').value.trim(),document_root:$('document_root').value.trim(),
+  aliases:$('aliases').value.split(',').map(v=>v.trim()).filter(Boolean),port:Number($('port').value),
+  ssl:$('ssl').checked,cert_name:$('cert_name').value.trim()||null,map_host:$('map_host').checked};
+  const current=selected===null?null:records.find(v=>v.name===selected);
+  const endpoint=current&&!current.managed?'/api/hosts':'/api/vhosts';
+  try { await request(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    selected=body.name; await load(); toast('Cambios guardados'); } catch(error) { toast(error.message,true); } };
+$('delete').onclick=async()=>{ if(!selected||!confirm(`¿Eliminar ${selected}? Se conservará una copia de respaldo.`)) return;
+  try { await request('/api/vhosts/'+encodeURIComponent(selected),{method:'DELETE'}); reset(); await load(); toast('Vhost eliminado'); }
+  catch(error) { toast(error.message,true); } };
+reset(); load();
+</script></body></html>""".replace("__TOKEN__", json.dumps(token))
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def send_json(self, status: int, payload: object) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def authorized(self) -> bool:
+            return secrets.compare_digest(self.headers.get("X-Vhost-Token", ""), token)
+
+        def settings(self) -> Settings:
+            return resolve_settings(config)
+
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            if path == "/":
+                body = html.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/api/vhosts" and self.authorized():
+                try:
+                    settings = self.settings()
+                    records = parse_vhosts(read_vhosts_file(settings))
+                    payload = [
+                        {
+                            "name": item.name,
+                            "document_root": item.document_root,
+                            "aliases": item.aliases,
+                            "port": item.port,
+                            "ssl": item.ssl,
+                            "cert_name": item.cert_name,
+                            "managed": item.managed,
+                            "host_mapped": has_managed_host_mapping(
+                                settings, item.name
+                            ),
+                        }
+                        for item in records
+                    ]
+                    self.send_json(200, {"vhosts": payload, "path": str(settings.vhosts_file)})
+                except (VhostManagerError, OSError) as exc:
+                    self.send_json(400, {"error": str(exc)})
+                return
+            self.send_json(404, {"error": "No encontrado"})
+
+        def read_payload(self) -> dict[str, object]:
+            try:
+                length = min(int(self.headers.get("Content-Length", "0")), 65536)
+                value = json.loads(self.rfile.read(length))
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise VhostManagerError("La petición no contiene JSON válido.") from exc
+            if not isinstance(value, dict):
+                raise VhostManagerError("La petición debe ser un objeto JSON.")
+            return value
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            if path not in {"/api/vhosts", "/api/hosts"} or not self.authorized():
+                self.send_json(403, {"error": "Petición no autorizada"})
+                return
+            try:
+                data = self.read_payload()
+                name = str(data.get("name", "")).strip()
+                original = str(data.get("original_name") or "").strip()
+                aliases = data.get("aliases", [])
+                if not isinstance(aliases, list):
+                    raise VhostManagerError("Los aliases no son válidos.")
+                alias_names = [
+                    str(alias).strip() for alias in aliases if str(alias).strip()
+                ]
+                map_host = bool(data.get("map_host"))
+
+                if path == "/api/hosts":
+                    settings = self.settings()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        if map_host:
+                            add_host_mapping(
+                                settings,
+                                name,
+                                alias_names,
+                                "127.0.0.1",
+                                replace=True,
+                            )
+                        elif has_managed_host_mapping(settings, name):
+                            host_remove(argparse.Namespace(name=name), settings)
+                    self.send_json(200, {"ok": True})
+                    return
+
+                if original and name != original:
+                    raise VhostManagerError(
+                        "Para cambiar ServerName, crea un vhost nuevo y elimina el anterior."
+                    )
+                document_root = str(data.get("document_root", "")).strip()
+                if not document_root:
+                    raise VhostManagerError("DocumentRoot es obligatorio.")
+                args = argparse.Namespace(
+                    name=name,
+                    document_root=document_root,
+                    alias=alias_names,
+                    port=valid_port(str(data.get("port", ""))),
+                    ssl=bool(data.get("ssl")),
+                    cert_name=str(data.get("cert_name") or "").strip() or None,
+                    map_host=map_host,
+                    replace=bool(original),
+                )
+                settings = self.settings()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    vhost_add(args, settings)
+                    if (
+                        original
+                        and not map_host
+                        and has_managed_host_mapping(settings, name)
+                    ):
+                        host_remove(argparse.Namespace(name=name), settings)
+                self.send_json(200, {"ok": True})
+            except (VhostManagerError, OSError, argparse.ArgumentTypeError) as exc:
+                self.send_json(400, {"error": str(exc)})
+
+        def do_DELETE(self) -> None:
+            path = urlparse(self.path).path
+            if not path.startswith("/api/vhosts/") or not self.authorized():
+                self.send_json(403, {"error": "Petición no autorizada"})
+                return
+            try:
+                name = unquote(path.removeprefix("/api/vhosts/"))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    vhost_remove(argparse.Namespace(name=name), self.settings())
+                self.send_json(200, {"ok": True})
+            except (VhostManagerError, OSError) as exc:
+                self.send_json(400, {"error": str(exc)})
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    except OSError as exc:
+        raise VhostManagerError(f"No se pudo iniciar la interfaz local: {exc}") from exc
+    url = f"http://127.0.0.1:{server.server_port}/"
+    print(f"Vhost Manager abierto en {url}")
+    print("Pulsa Ctrl+C para cerrarlo.")
+    if not webbrowser.open(url, new=1):
+        print(f"Abre esta dirección en tu navegador: {url}")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+def launch_gui(config_path: Path, config: dict[str, str]) -> None:
+    """Open the desktop manager. Tk is imported lazily so the CLI stays portable."""
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
+    except ImportError as exc:
+        raise VhostManagerError(
+            "The graphical interface requires Tkinter (the Python 'tk' package)."
+        ) from exc
+
+    class VhostManagerGUI:
+        def __init__(self) -> None:
+            self.root = tk.Tk()
+            self.root.withdraw()
+            self.root.title("Vhost Manager")
+            self.root.geometry("1060x650")
+            self.root.minsize(880, 560)
+            self.root.report_callback_exception = self._report_callback_exception
+            self.config = dict(config)
+            self.settings: Settings | None = None
+            self.records: dict[str, VhostRecord] = {}
+            self.editing_name: str | None = None
+            self.editor_enabled = False
+            self.editor_widgets: list[object] = []
+
+            style = ttk.Style(self.root)
+            if "aqua" in style.theme_names():
+                style.theme_use("aqua")
+            style.configure("Title.TLabel", font=("TkDefaultFont", 18, "bold"))
+            style.configure("Muted.TLabel", foreground="#666666")
+            style.configure("Danger.TButton", foreground="#a51d1d")
+
+            self._build()
+            self.root.createcommand("tk::mac::ReopenApplication", self._show_window)
+            self.root.after_idle(self._show_window)
+            self.root.after(50, self.reload)
+
+        def _show_window(self) -> None:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.update_idletasks()
+
+        def _report_callback_exception(self, exc_type, exc_value, _traceback) -> None:
+            message = f"{exc_type.__name__}: {exc_value}"
+            self.status_var.set(f"Error: {message}")
+            messagebox.showerror(
+                "Error en Vhost Manager",
+                f"La interfaz no pudo completar una operación:\n\n{message}",
+                parent=self.root,
+            )
+
+        def _build(self) -> None:
+            outer = ttk.Frame(self.root, padding=18)
+            outer.pack(fill="both", expand=True)
+
+            header = ttk.Frame(outer)
+            header.pack(fill="x", pady=(0, 14))
+            ttk.Label(header, text="Vhosts de Apache", style="Title.TLabel").pack(
+                side="left"
+            )
+            ttk.Button(header, text="Configuración", command=self.open_settings).pack(
+                side="right"
+            )
+            ttk.Button(header, text="Recargar", command=self.reload).pack(
+                side="right", padx=(0, 8)
+            )
+
+            pane = ttk.Panedwindow(outer, orient="horizontal")
+            pane.pack(fill="both", expand=True)
+
+            left = ttk.Frame(pane, padding=(0, 0, 12, 0))
+            right = ttk.Frame(pane, padding=(14, 4, 2, 2))
+            pane.add(left, weight=3)
+            pane.add(right, weight=2)
+
+            columns = ("name", "listen", "ssl", "root", "type")
+            self.tree = ttk.Treeview(
+                left, columns=columns, show="headings", selectmode="browse"
+            )
+            headings = {
+                "name": "Servidor",
+                "listen": "Puerto",
+                "ssl": "SSL",
+                "root": "Directorio",
+                "type": "Tipo",
+            }
+            widths = {"name": 170, "listen": 60, "ssl": 45, "root": 250, "type": 85}
+            for column in columns:
+                self.tree.heading(column, text=headings[column])
+                self.tree.column(column, width=widths[column], minwidth=45)
+            scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+            self.tree.configure(yscrollcommand=scrollbar.set)
+            self.tree.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            self.tree.bind("<<TreeviewSelect>>", self.on_select)
+
+            ttk.Label(right, text="Detalles", font=("TkDefaultFont", 13, "bold")).grid(
+                row=0, column=0, columnspan=3, sticky="w", pady=(0, 12)
+            )
+            self.name_var = tk.StringVar()
+            self.root_var = tk.StringVar()
+            self.alias_var = tk.StringVar()
+            self.port_var = tk.StringVar(value="80")
+            self.ssl_var = tk.BooleanVar()
+            self.cert_var = tk.StringVar()
+            self.map_var = tk.BooleanVar(value=True)
+            self.notice_var = tk.StringVar(value="Selecciona un vhost o crea uno nuevo.")
+
+            self.name_entry = self._field(right, 1, "ServerName", self.name_var)
+            self._field(right, 2, "DocumentRoot", self.root_var, browse=True)
+            self._field(right, 3, "Alias (separados por comas)", self.alias_var)
+            self._field(right, 4, "Puerto", self.port_var)
+            self.ssl_check = ttk.Checkbutton(
+                right, text="Activar SSL", variable=self.ssl_var, command=self._ssl_changed
+            )
+            self.ssl_check.grid(row=5, column=1, sticky="w", pady=5)
+            self.editor_widgets.append(self.ssl_check)
+            self.cert_label = ttk.Label(right, text="Certificado")
+            self.cert_label.grid(row=6, column=0, sticky="w", pady=5)
+            self.cert_entry = ttk.Entry(right, textvariable=self.cert_var)
+            self.cert_entry.grid(row=6, column=1, columnspan=2, sticky="ew", pady=5)
+            self.editor_widgets.append(self.cert_entry)
+            self.map_check = ttk.Checkbutton(
+                right,
+                text="Añadir nombres a /etc/hosts al crear",
+                variable=self.map_var,
+            )
+            self.map_check.grid(row=7, column=1, columnspan=2, sticky="w", pady=5)
+            self.editor_widgets.append(self.map_check)
+            ttk.Label(
+                right,
+                textvariable=self.notice_var,
+                style="Muted.TLabel",
+                wraplength=330,
+                justify="left",
+            ).grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+
+            buttons = ttk.Frame(right)
+            buttons.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+            self.new_button = ttk.Button(buttons, text="Nuevo", command=self.new_vhost)
+            self.new_button.pack(side="left")
+            self.save_button = ttk.Button(buttons, text="Guardar", command=self.save)
+            self.save_button.pack(side="left", padx=8)
+            self.delete_button = ttk.Button(
+                buttons, text="Eliminar", style="Danger.TButton", command=self.delete
+            )
+            self.delete_button.pack(side="right")
+            right.columnconfigure(1, weight=1)
+            self._ssl_changed()
+            self._set_editor_state(False)
+
+            self.status_var = tk.StringVar(value="Preparando…")
+            ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel").pack(
+                fill="x", pady=(10, 0)
+            )
+            self.new_vhost(clear_selection=False)
+
+        def _field(self, parent, row: int, label: str, variable, browse: bool = False):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            entry = ttk.Entry(parent, textvariable=variable)
+            entry.grid(row=row, column=1, sticky="ew", pady=5)
+            self.editor_widgets.append(entry)
+            if browse:
+                button = ttk.Button(parent, text="…", width=3, command=self.choose_root)
+                button.grid(row=row, column=2, padx=(6, 0), pady=5)
+                self.editor_widgets.append(button)
+            return entry
+
+        def _set_editor_state(self, enabled: bool, manual: bool = False) -> None:
+            state = "normal" if enabled and not manual else "disabled"
+            self.editor_enabled = state == "normal"
+            for widget in self.editor_widgets:
+                widget.configure(state=state)
+            if self.editor_enabled and not self.ssl_var.get():
+                self.cert_entry.configure(state="disabled")
+            if self.editor_enabled and self.editing_name:
+                self.name_entry.configure(state="disabled")
+                self.map_check.configure(state="disabled")
+            self.save_button.configure(state=state)
+            self.delete_button.configure(
+                state="normal" if enabled and not manual and self.editing_name else "disabled"
+            )
+
+        def _ssl_changed(self) -> None:
+            state = "normal" if self.editor_enabled and self.ssl_var.get() else "disabled"
+            self.cert_entry.configure(state=state)
+            if self.ssl_var.get() and not self.cert_var.get().strip():
+                self.cert_var.set(self.name_var.get().strip())
+
+        def choose_root(self) -> None:
+            selected = filedialog.askdirectory(
+                parent=self.root,
+                initialdir=self.root_var.get() or str(Path.home()),
+                title="Seleccionar DocumentRoot",
+            )
+            if selected:
+                self.root_var.set(selected)
+
+        def _resolve_settings(self) -> bool:
+            try:
+                self.settings = resolve_settings(self.config)
+                return True
+            except VhostManagerError as exc:
+                self.settings = None
+                self.status_var.set(str(exc))
+                if messagebox.askyesno(
+                    "Falta configuración",
+                    f"{exc}\n\n¿Quieres configurar ahora las rutas?",
+                    parent=self.root,
+                ):
+                    self.open_settings()
+                return False
+
+        def reload(self) -> None:
+            if not self._resolve_settings():
+                return
+            assert self.settings is not None
+            try:
+                records = parse_vhosts(read_vhosts_file(self.settings))
+            except (VhostManagerError, OSError) as exc:
+                self.status_var.set(f"Error: {exc}")
+                messagebox.showerror("No se pueden leer los vhosts", str(exc), parent=self.root)
+                return
+            selected = self.editing_name
+            self.records = {}
+            self.tree.delete(*self.tree.get_children())
+            for index, record in enumerate(records):
+                item_id = f"vhost-{index}"
+                self.records[item_id] = record
+                item = self.tree.insert(
+                    "",
+                    "end",
+                    iid=item_id,
+                    values=(
+                        record.name,
+                        record.port,
+                        "Sí" if record.ssl else "No",
+                        record.document_root,
+                        "Gestionado" if record.managed else "Manual",
+                    ),
+                )
+                if selected == record.name:
+                    self.tree.selection_set(item)
+            self.status_var.set(
+                f"{len(records)} vhost(s) · {self.settings.vhosts_file}"
+            )
+            if selected is None or not any(
+                record.name == selected for record in records
+            ):
+                self.new_vhost(clear_selection=False)
+
+        def on_select(self, _event=None) -> None:
+            selected = self.tree.selection()
+            if not selected:
+                return
+            record = self.records[selected[0]]
+            self.editing_name = record.name
+            self.name_var.set(record.name)
+            self.root_var.set(record.document_root)
+            self.alias_var.set(", ".join(record.aliases))
+            self.port_var.set(str(record.port))
+            self.ssl_var.set(record.ssl)
+            self.cert_var.set(record.cert_name)
+            self.map_var.set(False)
+            self._ssl_changed()
+            self._set_editor_state(True, manual=not record.managed)
+            if record.managed:
+                self.notice_var.set(
+                    "Al guardar se creará una copia de respaldo del archivo de vhosts."
+                )
+            else:
+                self.notice_var.set(
+                    "Este bloque no fue creado por Vhost Manager. Se muestra en solo lectura para no sobrescribir configuración manual."
+                )
+
+        def new_vhost(self, clear_selection: bool = True) -> None:
+            if clear_selection:
+                self.tree.selection_remove(self.tree.selection())
+            self.editing_name = None
+            self.name_var.set("")
+            self.root_var.set("")
+            self.alias_var.set("")
+            self.port_var.set("80")
+            self.ssl_var.set(False)
+            self.cert_var.set("")
+            self.map_var.set(True)
+            self._ssl_changed()
+            self._set_editor_state(True)
+            self.notice_var.set("Completa los datos para crear un vhost gestionado.")
+
+        def _aliases(self) -> list[str]:
+            return [
+                value.strip()
+                for value in re.split(r"[,\n]", self.alias_var.get())
+                if value.strip()
+            ]
+
+        def save(self) -> None:
+            if not self._resolve_settings():
+                return
+            name = self.name_var.get().strip()
+            document_root = self.root_var.get().strip()
+            if not name or not document_root:
+                messagebox.showwarning(
+                    "Faltan datos", "ServerName y DocumentRoot son obligatorios.", parent=self.root
+                )
+                return
+            if self.editing_name and name != self.editing_name:
+                messagebox.showwarning(
+                    "ServerName no editable",
+                    "Para cambiar el nombre, crea un vhost nuevo y elimina el anterior.",
+                    parent=self.root,
+                )
+                return
+            try:
+                port = valid_port(self.port_var.get().strip())
+                args = argparse.Namespace(
+                    name=name,
+                    document_root=document_root,
+                    alias=self._aliases(),
+                    port=port,
+                    ssl=self.ssl_var.get(),
+                    cert_name=self.cert_var.get().strip() or None,
+                    map_host=self.map_var.get() if self.editing_name is None else False,
+                    replace=self.editing_name is not None,
+                )
+                assert self.settings is not None
+                vhost_add(args, self.settings)
+            except (VhostManagerError, OSError, argparse.ArgumentTypeError) as exc:
+                messagebox.showerror("No se pudo guardar", str(exc), parent=self.root)
+                return
+            self.editing_name = name
+            self.reload()
+            messagebox.showinfo("Vhost guardado", f"{name} se ha guardado correctamente.", parent=self.root)
+
+        def delete(self) -> None:
+            if not self.editing_name or not self._resolve_settings():
+                return
+            name = self.editing_name
+            if not messagebox.askyesno(
+                "Eliminar vhost",
+                f"¿Eliminar el vhost gestionado {name}?\n\nSe conservará una copia de respaldo.",
+                parent=self.root,
+            ):
+                return
+            try:
+                assert self.settings is not None
+                vhost_remove(argparse.Namespace(name=name), self.settings)
+            except (VhostManagerError, OSError) as exc:
+                messagebox.showerror("No se pudo eliminar", str(exc), parent=self.root)
+                return
+            self.editing_name = None
+            self.reload()
+
+        def test_apache(self) -> None:
+            if not self._resolve_settings():
+                return
+            try:
+                assert self.settings is not None
+                run_apachectl(self.settings, "configtest")
+            except (VhostManagerError, OSError) as exc:
+                messagebox.showerror("Configuración inválida", str(exc), parent=self.root)
+            else:
+                messagebox.showinfo("Apache", "La configuración es válida.", parent=self.root)
+
+        def open_settings(self) -> None:
+            window = tk.Toplevel(self.root)
+            window.title("Configuración")
+            window.transient(self.root)
+            window.grab_set()
+            frame = ttk.Frame(window, padding=18)
+            frame.pack(fill="both", expand=True)
+            keys = (
+                ("vhosts_file", "Archivo de vhosts"),
+                ("certs_dir", "Directorio de certificados"),
+                ("apachectl", "Ejecutable apachectl"),
+                ("hosts_file", "Archivo hosts"),
+            )
+            variables: dict[str, tk.StringVar] = {}
+            for row, (key, label) in enumerate(keys):
+                ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=6)
+                variable = tk.StringVar(value=self.config.get(key, ""))
+                variables[key] = variable
+                ttk.Entry(frame, textvariable=variable, width=58).grid(
+                    row=row, column=1, sticky="ew", padx=(12, 0), pady=6
+                )
+
+            def save_settings() -> None:
+                values = {key: value.get().strip() for key, value in variables.items()}
+                if not all(values.values()):
+                    messagebox.showwarning(
+                        "Faltan rutas", "Completa las cuatro rutas.", parent=window
+                    )
+                    return
+                self.config.update(
+                    {key: str(Path(value).expanduser().resolve()) for key, value in values.items()}
+                )
+                try:
+                    config_path.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write(
+                        config_path,
+                        json.dumps(self.config, indent=2, ensure_ascii=False) + "\n",
+                    )
+                except (VhostManagerError, OSError) as exc:
+                    messagebox.showerror("No se pudo guardar", str(exc), parent=window)
+                    return
+                window.destroy()
+                self.reload()
+
+            actions = ttk.Frame(frame)
+            actions.grid(row=len(keys), column=0, columnspan=2, sticky="ew", pady=(14, 0))
+            ttk.Button(actions, text="Probar Apache", command=self.test_apache).pack(side="left")
+            ttk.Button(actions, text="Cancelar", command=window.destroy).pack(side="right")
+            ttk.Button(actions, text="Guardar", command=save_settings).pack(
+                side="right", padx=(0, 8)
+            )
+            frame.columnconfigure(1, weight=1)
+
+        def run(self) -> None:
+            self.root.mainloop()
+
+    VhostManagerGUI().run()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
@@ -676,7 +1532,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", type=Path, default=default_config_path(),
         help="JSON configuration file (default: %(default)s)",
     )
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command")
+
+    commands.add_parser("gui", help="open the graphical vhost manager in the browser")
+    commands.add_parser("desktop", help="open the experimental Tk desktop interface")
 
     config = commands.add_parser("config", help="view or change paths")
     config_commands = config.add_subparsers(dest="config_command", required=True)
@@ -758,6 +1617,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def dispatch(args: argparse.Namespace, config: dict[str, str]) -> None:
+    if args.command in {None, "gui"}:
+        launch_web_gui(args.config, config)
+        return
+    if args.command == "desktop":
+        launch_gui(args.config, config)
+        return
+
     if args.command == "config":
         if args.config_command == "show":
             config_show(args, config)

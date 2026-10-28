@@ -76,6 +76,54 @@ class VhostManagerTest(unittest.TestCase):
         self.invoke("vhost", "remove", "example.test")
         self.assertNotIn("example.test", self.vhosts.read_text(encoding="utf-8"))
 
+    def test_parse_vhosts_for_graphical_list(self):
+        self.invoke(
+            "vhost",
+            "add",
+            "parsed.test",
+            "--document-root",
+            str(self.root / "parsed"),
+            "--alias",
+            "www.parsed.test",
+            "--port",
+            "8080",
+        )
+        self.vhosts.write_text(
+            self.vhosts.read_text(encoding="utf-8")
+            + "\n<VirtualHost *:9000>\n"
+            + "    ServerName manual.test\n"
+            + f'    DocumentRoot "{self.root / "manual"}"\n'
+            + "</VirtualHost>\n",
+            encoding="utf-8",
+        )
+
+        records = vhost_manager.parse_vhosts(
+            self.vhosts.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual([record.name for record in records], ["parsed.test", "manual.test"])
+        self.assertEqual(records[0].aliases, ("www.parsed.test",))
+        self.assertEqual(records[0].port, 8080)
+        self.assertTrue(records[0].managed)
+        self.assertFalse(records[1].managed)
+
+    def test_graphical_interface_is_the_default_command(self):
+        with mock.patch.object(vhost_manager, "launch_web_gui") as launch_gui:
+            status = vhost_manager.main(["--config", str(self.config)])
+
+        self.assertEqual(status, 0)
+        launch_gui.assert_called_once()
+
+    def test_protected_file_uses_authorized_update(self):
+        backup = self.root / "authorized-backup"
+        with mock.patch.object(vhost_manager.os, "access", return_value=False), mock.patch.object(
+            vhost_manager, "privileged_update_file", return_value=backup
+        ) as privileged_update:
+            result = vhost_manager.update_file(self.hosts, "old", "new")
+
+        self.assertEqual(result, backup)
+        privileged_update.assert_called_once_with(self.hosts, "old", "new")
+
     def test_install_certificate_and_create_ssl_vhost(self):
         source_cert = self.root / "source.crt"
         source_key = self.root / "source.key"
@@ -189,11 +237,14 @@ class VhostManagerTest(unittest.TestCase):
         )
 
         self.assertIn("app.test", self.invoke("host", "list"))
+        settings = vhost_manager.resolve_settings(vhost_manager.read_config(self.config))
+        self.assertTrue(vhost_manager.has_managed_host_mapping(settings, "app.test"))
         hosts = self.hosts.read_text(encoding="utf-8")
         self.assertIn("# BEGIN vhost-manager: app.test", hosts)
         self.assertIn("127.0.0.1\tapp.test www.app.test", hosts)
 
         self.invoke("host", "remove", "app.test")
+        self.assertFalse(vhost_manager.has_managed_host_mapping(settings, "app.test"))
         self.assertNotIn("app.test", self.hosts.read_text(encoding="utf-8"))
 
     def test_manual_host_mapping_prevents_vhost_creation(self):
