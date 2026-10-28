@@ -618,7 +618,7 @@ def vhost_add(args: argparse.Namespace, settings: Settings) -> None:
     new_content = content.rstrip() + "\n\n" + block
     backup = update_file(settings.vhosts_file, original_content, new_content)
     print(f"Vhost {args.name} saved. Backup: {backup}")
-    if hosts_update:
+    if hosts_update and hosts_update[0] != hosts_update[1]:
         try:
             hosts_backup = update_file(
                 settings.hosts_file, hosts_update[0], hosts_update[1]

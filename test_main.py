@@ -76,6 +76,39 @@ class VhostManagerTest(unittest.TestCase):
         self.invoke("vhost", "remove", "example.test")
         self.assertNotIn("example.test", self.vhosts.read_text(encoding="utf-8"))
 
+    def test_replace_document_root_with_unchanged_host_mapping(self):
+        first_root = self.root / "first-public"
+        second_root = self.root / "second-public"
+        self.invoke(
+            "vhost",
+            "add",
+            "replace.test",
+            "--document-root",
+            str(first_root),
+            "--map-host",
+        )
+
+        self.invoke(
+            "vhost",
+            "add",
+            "replace.test",
+            "--document-root",
+            str(second_root),
+            "--map-host",
+            "--replace",
+        )
+
+        content = self.vhosts.read_text(encoding="utf-8")
+        self.assertIn(f'DocumentRoot "{second_root.resolve()}"', content)
+        self.assertIn(f'<Directory "{second_root.resolve()}">', content)
+        self.assertNotIn(str(first_root.resolve()), content)
+        self.assertEqual(
+            self.hosts.read_text(encoding="utf-8").count(
+                "# BEGIN vhost-manager: replace.test"
+            ),
+            1,
+        )
+
     def test_parse_vhosts_for_graphical_list(self):
         self.invoke(
             "vhost",
