@@ -3,9 +3,9 @@
 Gestor local para administrar virtual hosts, certificados y entradas de
 `/etc/hosts` de Apache instalado con Homebrew en macOS.
 
-La aplicación ofrece una interfaz gráfica en el navegador y conserva una CLI
-para automatización. No necesita frameworks web ni dependencias de Python de
-terceros.
+La aplicación ofrece una interfaz gráfica en el navegador, una interfaz desktop
+basada en Tk y una CLI para automatización. No necesita frameworks web ni
+dependencias de Python de terceros.
 
 ## Funcionalidades
 
@@ -14,8 +14,8 @@ terceros.
 - Configura `ServerName`, aliases, `DocumentRoot`, puerto y SSL.
 - Permite crear carpetas virtuales para organizar los vhosts sin modificar su
   configuración ni mover sus directorios.
-- Genera certificados autofirmados con OpenSSL cuando se activa SSL y no existe
-  todavía el par de certificado y clave.
+- Genera certificados de desarrollo con `mkcert` cuando se activa SSL; si no
+  está disponible, utiliza OpenSSL como alternativa.
 - Añade, actualiza o elimina bloques administrados en `/etc/hosts`.
 - Permite gestionar `/etc/hosts` también para vhosts escritos manualmente, sin
   modificar su configuración de Apache.
@@ -86,7 +86,7 @@ También puedes abrir explícitamente la interfaz con:
 python3 vhost-manager.py gui
 ```
 
-La interfaz experimental basada en Tk continúa disponible con:
+La interfaz desktop basada en Tk está disponible con:
 
 ```bash
 python3 vhost-manager.py desktop
@@ -130,7 +130,14 @@ cualquier Python compatible:
 python3 vhost-manager.py gui
 ```
 
-## Uso de la interfaz gráfica
+## Uso de la interfaz desktop
+
+La interfaz desktop se divide en tres pestañas:
+
+- **Listado** muestra los vhosts y sus carpetas organizativas.
+- **Nuevo vhost** contiene un formulario independiente para crear vhosts.
+- **Editar vhost** permanece deshabilitada hasta seleccionar un vhost y pulsar
+  **Editar** o hacer doble clic sobre él.
 
 ### Organizar vhosts en carpetas
 
@@ -139,8 +146,9 @@ Selecciona después un vhost y utiliza **Mover a…** para asignarlo a una carpe
 o devolverlo a **Sin carpeta**. Las carpetas son únicamente organizativas:
 eliminarlas no borra los vhosts ni modifica Apache.
 
-La organización se guarda en `~/.config/vhost-manager/groups.json` y se conserva
-entre ejecuciones.
+Con la configuración predeterminada, la organización se guarda en
+`~/.config/vhost-manager/groups.json` y se conserva entre ejecuciones. Si se usa
+`--config`, `groups.json` se guarda junto al archivo de configuración indicado.
 
 ### Crear un vhost
 
@@ -149,8 +157,8 @@ entre ejecuciones.
 2. Introduce `ServerName` y `DocumentRoot`.
 3. Añade aliases separados por comas si son necesarios.
 4. Selecciona el puerto y activa SSL si procede.
-5. Mantén marcada **Gestionar en /etc/hosts** para asociar el dominio y sus
-   aliases a `127.0.0.1`.
+5. Mantén marcada **Añadir nombres a /etc/hosts al crear** para asociar el
+   dominio y sus aliases a `127.0.0.1`.
 6. Pulsa **Guardar**.
 
 Si SSL está activado y no existe un certificado con el nombre indicado, la
@@ -186,9 +194,9 @@ directamente: crea un vhost nuevo y elimina el anterior.
 ### Vhosts manuales
 
 Al seleccionar un vhost marcado como **Manual**, sus directivas permanecen en
-solo lectura. Sí puedes activar **Gestionar en /etc/hosts** y pulsar
-**Guardar hosts** para crear una entrada administrada sin alterar el bloque de
-Apache.
+modo de solo lectura para no alterar configuración que la aplicación no creó.
+La interfaz web permite gestionar por separado su entrada en `/etc/hosts`
+mediante **Gestionar en /etc/hosts** y **Guardar hosts**.
 
 ## Permisos y copias de seguridad
 
@@ -300,10 +308,9 @@ python3 vhost-manager.py host remove ejemplo.test
 # Listar certificados y claves
 python3 vhost-manager.py cert list
 
-# Generar un certificado autofirmado
+# Generar un certificado local con mkcert (o con OpenSSL como alternativa)
 python3 vhost-manager.py cert generate ejemplo.test \
-  --san www.ejemplo.test \
-  --days 825
+  --san www.ejemplo.test
 
 # Importar un certificado existente
 python3 vhost-manager.py cert install ejemplo.test \
