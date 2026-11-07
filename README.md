@@ -12,6 +12,8 @@ terceros.
 - Lista los `VirtualHost` configurados en Apache.
 - Crea, modifica y elimina vhosts administrados por la aplicación.
 - Configura `ServerName`, aliases, `DocumentRoot`, puerto y SSL.
+- Permite crear carpetas virtuales para organizar los vhosts sin modificar su
+  configuración ni mover sus directorios.
 - Genera certificados autofirmados con OpenSSL cuando se activa SSL y no existe
   todavía el par de certificado y clave.
 - Añade, actualiza o elimina bloques administrados en `/etc/hosts`.
@@ -37,7 +39,9 @@ aplicación.
 - macOS.
 - Python 3.9 o posterior con la biblioteca estándar.
 - Apache instalado mediante Homebrew.
-- OpenSSL disponible en `PATH` para generar certificados.
+- `mkcert` y NSS recomendados para generar certificados de desarrollo que
+  Safari y Firefox reconozcan. OpenSSL se utiliza como alternativa, pero sus
+  certificados autofirmados no se consideran fiables automáticamente.
 - El archivo `httpd-vhosts.conf` incluido desde la configuración principal de
   Apache.
 
@@ -45,7 +49,11 @@ Una instalación típica de Apache es:
 
 ```bash
 brew install httpd
+brew install mkcert nss
+mkcert -install
 ```
+
+Después de `mkcert -install`, reinicia Firefox para que cargue la CA local.
 
 Comprueba que `httpd.conf` incluye el archivo de vhosts y que los módulos
 necesarios para SSL están habilitados si vas a utilizar HTTPS.
@@ -84,11 +92,60 @@ La interfaz experimental basada en Tk continúa disponible con:
 python3 vhost-manager.py desktop
 ```
 
+La interfaz desktop requiere Tcl/Tk 8.6 o posterior. El Python proporcionado
+por macOS o por las Command Line Tools utiliza el antiguo Tk 8.5, que en
+versiones actuales de macOS puede abrir una ventana completamente en blanco.
+Para usar la interfaz desktop, instala un Python con Tk moderno mediante
+Homebrew:
+
+```bash
+brew install python@3.13 python-tk@3.13
+$(brew --prefix)/bin/python3.13 vhost-manager.py desktop
+```
+
+Si utilizas el enlace ejecutable `vhost-manager`, añade el Python de Homebrew
+al principio del `PATH` en `~/.zshrc`:
+
+```bash
+export PATH="$(brew --prefix)/opt/python@3.13/libexec/bin:$PATH"
+```
+
+Abre una terminal nueva, o recarga la configuración con `source ~/.zshrc`, y
+comprueba que ya se selecciona el intérprete correcto:
+
+```bash
+command -v python3
+python3 -c 'import tkinter; print(tkinter.TkVersion)'
+vhost-manager desktop
+```
+
+Los dos primeros comandos deben mostrar una ruta dentro de `/opt/homebrew` y
+una versión de Tk igual o posterior a 8.6, respectivamente.
+
+En PyCharm, selecciona ese mismo ejecutable de Homebrew como intérprete del
+proyecto. La interfaz web no depende de Tk y puede seguir ejecutándose con
+cualquier Python compatible:
+
+```bash
+python3 vhost-manager.py gui
+```
+
 ## Uso de la interfaz gráfica
+
+### Organizar vhosts en carpetas
+
+En la pestaña **Listado**, pulsa **Nueva carpeta** para crear una agrupación.
+Selecciona después un vhost y utiliza **Mover a…** para asignarlo a una carpeta
+o devolverlo a **Sin carpeta**. Las carpetas son únicamente organizativas:
+eliminarlas no borra los vhosts ni modifica Apache.
+
+La organización se guarda en `~/.config/vhost-manager/groups.json` y se conserva
+entre ejecuciones.
 
 ### Crear un vhost
 
-1. Pulsa **Nuevo**.
+1. Pulsa **Nuevo** en la parte derecha de la barra del listado, o abre la
+   pestaña **Nuevo vhost**.
 2. Introduce `ServerName` y `DocumentRoot`.
 3. Añade aliases separados por comas si son necesarios.
 4. Selecciona el puerto y activa SSL si procede.
@@ -97,13 +154,34 @@ python3 vhost-manager.py desktop
 6. Pulsa **Guardar**.
 
 Si SSL está activado y no existe un certificado con el nombre indicado, la
-aplicación genera automáticamente un certificado autofirmado y su clave privada.
+aplicación utiliza `mkcert` para generar un certificado emitido por la CA local.
+Esto permite que Safari y Firefox lo validen cuando la CA se ha instalado con
+`mkcert -install`. Si `mkcert` no está disponible, se genera como alternativa un
+certificado autofirmado con OpenSSL y las extensiones TLS de servidor correctas,
+pero será necesario confiar en él manualmente.
+
+Al guardar o eliminar un vhost desde la interfaz, la aplicación valida la
+configuración y recarga Apache automáticamente. Si el proceso maestro de Apache
+se ejecuta como `root`, macOS solicitará autorización administrativa para la
+recarga. Sin ella, Apache continuará sirviendo la configuración y los
+certificados que tenía cargados anteriormente.
+
+Para reemplazar un certificado antiguo generado por la aplicación:
+
+```bash
+vhost-manager cert generate ejemplo.test --force
+vhost-manager vhost reload
+```
+
+La clave `rootCA-key.pem` de `mkcert` permite emitir certificados confiables en
+el equipo: no debe compartirse ni copiarse fuera de su directorio privado.
 
 ### Modificar un vhost
 
-Selecciona un vhost marcado como **Gestionado**, cambia sus datos y pulsa
-**Guardar**. `ServerName` no se puede renombrar directamente: crea un vhost nuevo
-y elimina el anterior.
+Selecciona un vhost marcado como **Gestionado** y pulsa **Editar** —también
+puedes hacer doble clic— para habilitar y abrir la pestaña **Editar vhost**.
+Cambia sus datos y pulsa **Guardar**. `ServerName` no se puede renombrar
+directamente: crea un vhost nuevo y elimina el anterior.
 
 ### Vhosts manuales
 

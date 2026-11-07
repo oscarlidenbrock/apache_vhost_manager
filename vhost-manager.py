@@ -280,6 +280,50 @@ def atomic_write(path: Path, content: str) -> None:
         raise VhostManagerError(f"Could not write {path}: {exc}") from exc
 
 
+def read_vhost_groups(path: Path) -> dict[str, list[str]]:
+    """Read the optional UI-only grouping metadata."""
+
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VhostManagerError(f"No se pueden leer las carpetas de gestión: {exc}") from exc
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(groups, dict):
+        raise VhostManagerError("El archivo de carpetas de gestión no es válido.")
+    result: dict[str, list[str]] = {}
+    for raw_name, raw_members in groups.items():
+        name = str(raw_name).strip()
+        if not name or not isinstance(raw_members, list):
+            continue
+        result[name] = list(dict.fromkeys(
+            str(member).strip() for member in raw_members if str(member).strip()
+        ))
+    return result
+
+
+def write_vhost_groups(path: Path, groups: dict[str, list[str]]) -> None:
+    payload = {
+        "groups": {
+            name: sorted(set(members), key=str.casefold)
+            for name, members in sorted(groups.items(), key=lambda item: item[0].casefold())
+        }
+    }
+    atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def assign_vhost_group(
+    groups: dict[str, list[str]], vhost_name: str, group_name: str | None
+) -> None:
+    """Move a vhost to one group, or leave it ungrouped when group_name is None."""
+
+    for members in groups.values():
+        members[:] = [member for member in members if member != vhost_name]
+    if group_name is not None:
+        groups.setdefault(group_name, []).append(vhost_name)
+
+
 def update_file(path: Path, old: str, new: str) -> Path:
     if old == new:
         raise VhostManagerError("There are no changes to save.")
@@ -660,7 +704,9 @@ def vhost_remove(args: argparse.Namespace, settings: Settings) -> None:
     print(f"Vhost {name} removed. Backup: {backup}")
 
 
-def run_apachectl(settings: Settings, *arguments: str) -> None:
+def run_apachectl(
+    settings: Settings, *arguments: str, authorize_on_failure: bool = False
+) -> None:
     executable = settings.apachectl
     if not executable.is_file():
         raise VhostManagerError(f"apachectl does not exist at {executable}.")
@@ -668,12 +714,37 @@ def run_apachectl(settings: Settings, *arguments: str) -> None:
         [str(executable), *arguments], capture_output=True, text=True, check=False
     )
     output = (result.stdout + result.stderr).strip()
+    if not result.returncode:
+        if output:
+            print(output)
+        return
+    if authorize_on_failure and sys.platform == "darwin":
+        command = " ".join(
+            shlex.quote(part) for part in (str(executable), *arguments)
+        )
+        apple_command = command.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'do shell script "{apple_command}" with administrator privileges'
+        authorized = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        authorized_output = (authorized.stdout + authorized.stderr).strip()
+        if authorized_output:
+            print(authorized_output)
+        if authorized.returncode == 0:
+            return
+        if "canceled" in authorized_output.lower() or "cancelled" in authorized_output.lower():
+            raise VhostManagerError("Authorization was cancelled.")
     if output:
         print(output)
-    if result.returncode:
-        raise VhostManagerError(
-            f"apachectl exited with code {result.returncode}."
-        )
+    raise VhostManagerError(f"apachectl exited with code {result.returncode}.")
+
+
+def validate_and_reload_apache(settings: Settings) -> None:
+    run_apachectl(settings, "configtest")
+    run_apachectl(settings, "-k", "graceful", authorize_on_failure=True)
 
 
 def cert_paths(settings: Settings, name: str) -> tuple[Path, Path]:
@@ -758,28 +829,53 @@ def generate_self_signed_certificate(
         raise VhostManagerError("--days must be a positive number.")
     if (cert.exists() or key.exists()) and not force:
         raise VhostManagerError("The certificate already exists; use --force to replace it.")
-    openssl = shutil.which("openssl")
-    if not openssl:
-        raise VhostManagerError("openssl was not found in PATH.")
     settings.certs_dir.mkdir(parents=True, exist_ok=True)
-    san_names = list(dict.fromkeys(validate_name(name) for name in sans))
+    san_names = list(
+        dict.fromkeys([common_name, *(validate_name(name) for name in sans)])
+    )
     with tempfile.TemporaryDirectory(dir=settings.certs_dir) as temporary:
         temp_cert = Path(temporary) / "certificate.crt"
         temp_key = Path(temporary) / "private.key"
-        command = [
-            openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
-            "-days", str(days), "-keyout", str(temp_key), "-out", str(temp_cert),
-            "-subj", f"/CN={common_name}", "-addext",
-            "subjectAltName=" + ",".join(f"DNS:{name}" for name in san_names),
-        ]
+        mkcert = shutil.which("mkcert")
+        if mkcert:
+            command = [
+                mkcert,
+                "-cert-file", str(temp_cert),
+                "-key-file", str(temp_key),
+                *san_names,
+            ]
+            generated_with = "mkcert"
+        else:
+            openssl = shutil.which("openssl")
+            if not openssl:
+                raise VhostManagerError("Neither mkcert nor openssl was found in PATH.")
+            command = [
+                openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+                "-days", str(days), "-keyout", str(temp_key), "-out", str(temp_cert),
+                "-subj", f"/CN={common_name}",
+                "-addext", "basicConstraints=critical,CA:FALSE",
+                "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+                "-addext", "extendedKeyUsage=serverAuth",
+                "-addext",
+                "subjectAltName=" + ",".join(f"DNS:{name}" for name in san_names),
+            ]
+            generated_with = "openssl"
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode:
-            raise VhostManagerError(result.stderr.strip() or "openssl failed.")
+            raise VhostManagerError(
+                result.stderr.strip() or f"{generated_with} failed."
+            )
         os.replace(temp_cert, cert)
         os.replace(temp_key, key)
     cert.chmod(0o644)
     key.chmod(0o600)
-    print(f"Self-signed certificate generated at {cert}")
+    if generated_with == "mkcert":
+        print(f"Locally trusted certificate generated with mkcert at {cert}")
+    else:
+        print(
+            f"Self-signed certificate generated at {cert}. Install mkcert and its "
+            "local CA for automatic browser trust."
+        )
     return cert, key
 
 
@@ -849,6 +945,9 @@ def launch_web_gui(config_path: Path, config: dict[str, str]) -> None:
       font-size:12px; font-weight:600 } input { display:block; width:100%; margin-top:6px;
       border:1px solid #cfd6df; border-radius:7px; padding:10px 11px; font:inherit; color:var(--text) }
     input:focus { outline:2px solid #b9d3ff; border-color:var(--blue) }
+    .path-picker { display:flex; gap:8px; margin-top:6px }
+    .path-picker input { margin-top:0 }
+    .path-picker button { flex:0 0 auto; font-weight:500 }
     .row { display:grid; grid-template-columns:1fr 1fr; gap:12px }
     .check { display:flex; align-items:center; gap:8px; font-size:13px; font-weight:500 }
     .check input { width:auto; margin:0 }.actions { display:flex; gap:9px; margin-top:20px }
@@ -875,7 +974,10 @@ def launch_web_gui(config_path: Path, config: dict[str, str]) -> None:
     <div class="panel-title"><h2 id="form-title">Nuevo vhost</h2><button id="new">Nuevo</button></div>
     <form id="form">
       <label>ServerName<input id="name" required placeholder="proyecto.test"></label>
-      <label>DocumentRoot<input id="document_root" required placeholder="/ruta/al/public"></label>
+      <label>DocumentRoot<div class="path-picker">
+        <input id="document_root" required placeholder="/ruta/al/public">
+        <button id="choose_root" type="button">Seleccionar…</button>
+      </div></label>
       <label>Aliases, separados por comas<input id="aliases" placeholder="www.proyecto.test"></label>
       <div class="row"><label>Puerto<input id="port" type="number" min="1" max="65535" value="80" required></label>
         <label>Certificado<input id="cert_name" placeholder="proyecto.test" disabled></label></div>
@@ -891,7 +993,7 @@ def launch_web_gui(config_path: Path, config: dict[str, str]) -> None:
 const TOKEN = __TOKEN__;
 let records = [], selected = null;
 const $ = id => document.getElementById(id);
-const fields = ['name','document_root','aliases','port','cert_name','ssl','map_host'];
+const fields = ['name','document_root','choose_root','aliases','port','cert_name','ssl','map_host'];
 function toast(message, error=false) { const el=$('toast'); el.textContent=message;
   el.className='show'+(error?' error':''); clearTimeout(el.timer);
   el.timer=setTimeout(()=>el.className='',2800); }
@@ -922,8 +1024,14 @@ function reset() { selected=null; $('form').reset(); $('port').value=80; $('map_
   $('form-title').textContent='Nuevo vhost'; setDisabled(false); $('cert_name').disabled=true;
   $('save').textContent='Guardar'; $('delete').disabled=true; $('notice').textContent='Completa los datos para crear un vhost gestionado.';
   document.querySelectorAll('tr.selected').forEach(r=>r.classList.remove('selected')); }
-$('ssl').onchange=()=>{ $('cert_name').disabled=!$('ssl').checked;
-  if($('ssl').checked&&!$('cert_name').value) $('cert_name').value=$('name').value; };
+$('ssl').onchange=()=>{ const enabled=$('ssl').checked; $('port').value=enabled?443:80;
+  $('cert_name').disabled=!enabled;
+  if(enabled&&!$('cert_name').value) $('cert_name').value=$('name').value; };
+$('choose_root').onclick=async()=>{ try {
+  const data=await request('/api/select-directory',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({initial:$('document_root').value.trim()})});
+  if(data.path) $('document_root').value=data.path;
+} catch(error) { toast(error.message,true); } };
 $('new').onclick=reset; $('refresh').onclick=load;
 $('form').onsubmit=async event=>{ event.preventDefault(); const body={original_name:selected,
   name:$('name').value.trim(),document_root:$('document_root').value.trim(),
@@ -1006,11 +1114,50 @@ reset(); load();
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
-            if path not in {"/api/vhosts", "/api/hosts"} or not self.authorized():
+            if path not in {
+                "/api/vhosts", "/api/hosts", "/api/select-directory"
+            } or not self.authorized():
                 self.send_json(403, {"error": "Petición no autorizada"})
                 return
             try:
                 data = self.read_payload()
+                if path == "/api/select-directory":
+                    osascript = shutil.which("osascript")
+                    if not osascript:
+                        raise VhostManagerError(
+                            "El selector de carpetas solo está disponible en macOS."
+                        )
+                    initial = Path(str(data.get("initial") or Path.home())).expanduser()
+                    if not initial.is_dir():
+                        initial = Path.home()
+                    script = (
+                        'set initialFolder to POSIX file '
+                        '(system attribute "VHOST_MANAGER_INITIAL_DIR")\n'
+                        "set selectedFolder to choose folder with prompt "
+                        '"Seleccionar DocumentRoot" default location initialFolder\n'
+                        "POSIX path of selectedFolder"
+                    )
+                    result = subprocess.run(
+                        [osascript, "-e", script],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        env={
+                            **os.environ,
+                            "VHOST_MANAGER_INITIAL_DIR": str(initial),
+                        },
+                    )
+                    if result.returncode == 0:
+                        self.send_json(200, {"path": result.stdout.strip().rstrip("/")})
+                    elif result.returncode == 1 and (
+                        "canceled" in result.stderr.lower() or "(-128)" in result.stderr
+                    ):
+                        self.send_json(200, {"path": None})
+                    else:
+                        raise VhostManagerError(
+                            result.stderr.strip() or "No se pudo abrir el selector de carpetas."
+                        )
+                    return
                 name = str(data.get("name", "")).strip()
                 original = str(data.get("original_name") or "").strip()
                 aliases = data.get("aliases", [])
@@ -1063,6 +1210,7 @@ reset(); load();
                         and has_managed_host_mapping(settings, name)
                     ):
                         host_remove(argparse.Namespace(name=name), settings)
+                    validate_and_reload_apache(settings)
                 self.send_json(200, {"ok": True})
             except (VhostManagerError, OSError, argparse.ArgumentTypeError) as exc:
                 self.send_json(400, {"error": str(exc)})
@@ -1076,6 +1224,7 @@ reset(); load();
                 name = unquote(path.removeprefix("/api/vhosts/"))
                 with contextlib.redirect_stdout(io.StringIO()):
                     vhost_remove(argparse.Namespace(name=name), self.settings())
+                    validate_and_reload_apache(self.settings())
                 self.send_json(200, {"ok": True})
             except (VhostManagerError, OSError) as exc:
                 self.send_json(400, {"error": str(exc)})
@@ -1098,6 +1247,8 @@ reset(); load();
 def launch_gui(config_path: Path, config: dict[str, str]) -> None:
     """Open the desktop manager. Tk is imported lazily so the CLI stays portable."""
 
+    # Apple's system Tk emits this warning even when it is working correctly.
+    os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
@@ -1105,16 +1256,25 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
         raise VhostManagerError(
             "The graphical interface requires Tkinter (the Python 'tk' package)."
         ) from exc
+    if tk.TkVersion < 8.6:
+        raise VhostManagerError(
+            f"La interfaz desktop requiere Tcl/Tk 8.6 o posterior; "
+            f"{sys.executable} utiliza Tk {tk.TkVersion}. El Tk 8.5 incluido "
+            "con macOS puede mostrar una ventana en blanco. Instala Python y "
+            "python-tk con Homebrew o utiliza la interfaz web."
+        )
 
     class VhostManagerGUI:
         def __init__(self) -> None:
             self.root = tk.Tk()
-            self.root.withdraw()
             self.root.title("Vhost Manager")
             self.root.geometry("1060x650")
             self.root.minsize(880, 560)
             self.root.report_callback_exception = self._report_callback_exception
             self.config = dict(config)
+            self.groups_path = config_path.parent / "groups.json"
+            self.groups: dict[str, list[str]] = {}
+            self.folder_items: dict[str, str] = {}
             self.settings: Settings | None = None
             self.records: dict[str, VhostRecord] = {}
             self.editing_name: str | None = None
@@ -1130,7 +1290,6 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
 
             self._build()
             self.root.createcommand("tk::mac::ReopenApplication", self._show_window)
-            self.root.after_idle(self._show_window)
             self.root.after(50, self.reload)
 
         def _show_window(self) -> None:
@@ -1163,35 +1322,73 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                 side="right", padx=(0, 8)
             )
 
-            pane = ttk.Panedwindow(outer, orient="horizontal")
-            pane.pack(fill="both", expand=True)
+            self.notebook = ttk.Notebook(outer)
+            self.notebook.pack(fill="both", expand=True)
+            self.list_tab = ttk.Frame(self.notebook, padding=12)
+            self.new_tab = ttk.Frame(self.notebook, padding=18)
+            self.editor_tab = ttk.Frame(self.notebook, padding=18)
+            self.notebook.add(self.list_tab, text="Listado")
+            self.notebook.add(self.new_tab, text="Nuevo vhost")
+            self.notebook.add(self.editor_tab, text="Editar vhost", state="disabled")
 
-            left = ttk.Frame(pane, padding=(0, 0, 12, 0))
-            right = ttk.Frame(pane, padding=(14, 4, 2, 2))
-            pane.add(left, weight=3)
-            pane.add(right, weight=2)
+            list_toolbar = ttk.Frame(self.list_tab)
+            list_toolbar.pack(fill="x", pady=(0, 10))
+            ttk.Button(
+                list_toolbar, text="Nueva carpeta", command=self.create_folder
+            ).pack(side="left")
+            self.delete_folder_button = ttk.Button(
+                list_toolbar,
+                text="Eliminar carpeta",
+                command=self.delete_folder,
+                state="disabled",
+            )
+            self.delete_folder_button.pack(side="left", padx=(8, 0))
+            self.move_button = ttk.Menubutton(
+                list_toolbar, text="Mover a…", state="disabled"
+            )
+            self.move_menu = tk.Menu(self.move_button, tearoff=False)
+            self.move_button.configure(menu=self.move_menu)
+            self.move_button.pack(side="left", padx=(8, 0))
+            self.edit_button = ttk.Button(
+                list_toolbar, text="Editar", command=self.open_selected_vhost,
+                state="disabled",
+            )
+            self.edit_button.pack(side="right")
+            self.new_button = ttk.Button(
+                list_toolbar, text="Nuevo", command=self.new_vhost
+            )
+            self.new_button.pack(side="right", padx=(0, 8))
 
-            columns = ("name", "listen", "ssl", "root", "type")
+            tree_frame = ttk.Frame(self.list_tab)
+            tree_frame.pack(fill="both", expand=True)
+            columns = ("listen", "ssl", "root", "type")
             self.tree = ttk.Treeview(
-                left, columns=columns, show="headings", selectmode="browse"
+                tree_frame, columns=columns, show="tree headings", selectmode="browse"
             )
             headings = {
-                "name": "Servidor",
                 "listen": "Puerto",
                 "ssl": "SSL",
                 "root": "Directorio",
                 "type": "Tipo",
             }
-            widths = {"name": 170, "listen": 60, "ssl": 45, "root": 250, "type": 85}
+            self.tree.heading("#0", text="Servidor")
+            self.tree.column("#0", width=230, minwidth=170)
+            widths = {"listen": 60, "ssl": 45, "root": 300, "type": 85}
             for column in columns:
                 self.tree.heading(column, text=headings[column])
                 self.tree.column(column, width=widths[column], minwidth=45)
-            scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+            scrollbar = ttk.Scrollbar(
+                tree_frame, orient="vertical", command=self.tree.yview
+            )
             self.tree.configure(yscrollcommand=scrollbar.set)
             self.tree.pack(side="left", fill="both", expand=True)
             scrollbar.pack(side="right", fill="y")
             self.tree.bind("<<TreeviewSelect>>", self.on_select)
+            self.tree.bind("<Double-1>", self.open_selected_vhost)
 
+            self._build_new_form()
+
+            right = self.editor_tab
             ttk.Label(right, text="Detalles", font=("TkDefaultFont", 13, "bold")).grid(
                 row=0, column=0, columnspan=3, sticky="w", pady=(0, 12)
             )
@@ -1235,10 +1432,8 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
 
             buttons = ttk.Frame(right)
             buttons.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-            self.new_button = ttk.Button(buttons, text="Nuevo", command=self.new_vhost)
-            self.new_button.pack(side="left")
             self.save_button = ttk.Button(buttons, text="Guardar", command=self.save)
-            self.save_button.pack(side="left", padx=8)
+            self.save_button.pack(side="left")
             self.delete_button = ttk.Button(
                 buttons, text="Eliminar", style="Danger.TButton", command=self.delete
             )
@@ -1251,17 +1446,99 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
             ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel").pack(
                 fill="x", pady=(10, 0)
             )
-            self.new_vhost(clear_selection=False)
+            self.new_vhost(clear_selection=False, show_editor=False)
 
-        def _field(self, parent, row: int, label: str, variable, browse: bool = False):
+        def _build_new_form(self) -> None:
+            form = self.new_tab
+            ttk.Label(
+                form, text="Nuevo vhost", font=("TkDefaultFont", 13, "bold")
+            ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+            self.new_name_var = tk.StringVar()
+            self.new_root_var = tk.StringVar()
+            self.new_alias_var = tk.StringVar()
+            self.new_port_var = tk.StringVar(value="80")
+            self.new_ssl_var = tk.BooleanVar()
+            self.new_cert_var = tk.StringVar()
+            self.new_map_var = tk.BooleanVar(value=True)
+            self.new_widgets: list[object] = []
+
+            self._field(
+                form, 1, "ServerName", self.new_name_var, widgets=self.new_widgets
+            )
+            self._field(
+                form,
+                2,
+                "DocumentRoot",
+                self.new_root_var,
+                browse=True,
+                widgets=self.new_widgets,
+                browse_command=lambda: self.choose_root(self.new_root_var),
+            )
+            self._field(
+                form, 3, "Alias (separados por comas)", self.new_alias_var,
+                widgets=self.new_widgets,
+            )
+            self._field(
+                form, 4, "Puerto", self.new_port_var, widgets=self.new_widgets
+            )
+            new_ssl = ttk.Checkbutton(
+                form,
+                text="Activar SSL",
+                variable=self.new_ssl_var,
+                command=self._new_ssl_changed,
+            )
+            new_ssl.grid(row=5, column=1, sticky="w", pady=5)
+            self.new_widgets.append(new_ssl)
+            ttk.Label(form, text="Certificado").grid(
+                row=6, column=0, sticky="w", pady=5
+            )
+            self.new_cert_entry = ttk.Entry(form, textvariable=self.new_cert_var)
+            self.new_cert_entry.grid(
+                row=6, column=1, columnspan=2, sticky="ew", pady=5
+            )
+            self.new_cert_entry.configure(state="disabled")
+            self.new_widgets.append(self.new_cert_entry)
+            new_map = ttk.Checkbutton(
+                form,
+                text="Añadir nombres a /etc/hosts al crear",
+                variable=self.new_map_var,
+            )
+            new_map.grid(row=7, column=1, columnspan=2, sticky="w", pady=5)
+            self.new_widgets.append(new_map)
+            ttk.Label(
+                form,
+                text="Completa los datos para crear un vhost gestionado.",
+                style="Muted.TLabel",
+            ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 8))
+            ttk.Button(form, text="Guardar", command=self.save_new).grid(
+                row=9, column=0, columnspan=3, sticky="w", pady=(8, 0)
+            )
+            form.columnconfigure(1, weight=1)
+
+        def _field(
+            self,
+            parent,
+            row: int,
+            label: str,
+            variable,
+            browse: bool = False,
+            widgets: list[object] | None = None,
+            browse_command=None,
+        ):
+            target_widgets = self.editor_widgets if widgets is None else widgets
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
             entry = ttk.Entry(parent, textvariable=variable)
             entry.grid(row=row, column=1, sticky="ew", pady=5)
-            self.editor_widgets.append(entry)
+            target_widgets.append(entry)
             if browse:
-                button = ttk.Button(parent, text="…", width=3, command=self.choose_root)
+                button = ttk.Button(
+                    parent,
+                    text="…",
+                    width=3,
+                    command=browse_command or self.choose_root,
+                )
                 button.grid(row=row, column=2, padx=(6, 0), pady=5)
-                self.editor_widgets.append(button)
+                target_widgets.append(button)
             return entry
 
         def _set_editor_state(self, enabled: bool, manual: bool = False) -> None:
@@ -1279,20 +1556,31 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                 state="normal" if enabled and not manual and self.editing_name else "disabled"
             )
 
-        def _ssl_changed(self) -> None:
+        def _ssl_changed(self, update_port: bool = True) -> None:
+            if update_port:
+                self.port_var.set("443" if self.ssl_var.get() else "80")
             state = "normal" if self.editor_enabled and self.ssl_var.get() else "disabled"
             self.cert_entry.configure(state=state)
             if self.ssl_var.get() and not self.cert_var.get().strip():
                 self.cert_var.set(self.name_var.get().strip())
 
-        def choose_root(self) -> None:
+        def _new_ssl_changed(self, update_port: bool = True) -> None:
+            enabled = self.new_ssl_var.get()
+            if update_port:
+                self.new_port_var.set("443" if enabled else "80")
+            self.new_cert_entry.configure(state="normal" if enabled else "disabled")
+            if enabled and not self.new_cert_var.get().strip():
+                self.new_cert_var.set(self.new_name_var.get().strip())
+
+        def choose_root(self, variable=None) -> None:
+            target = variable or self.root_var
             selected = filedialog.askdirectory(
                 parent=self.root,
-                initialdir=self.root_var.get() or str(Path.home()),
+                initialdir=target.get() or str(Path.home()),
                 title="Seleccionar DocumentRoot",
             )
             if selected:
-                self.root_var.set(selected)
+                target.set(selected)
 
         def _resolve_settings(self) -> bool:
             try:
@@ -1309,6 +1597,127 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                     self.open_settings()
                 return False
 
+        def _save_groups(self) -> bool:
+            try:
+                write_vhost_groups(self.groups_path, self.groups)
+                return True
+            except VhostManagerError as exc:
+                messagebox.showerror(
+                    "No se pueden guardar las carpetas", str(exc), parent=self.root
+                )
+                return False
+
+        def _refresh_move_menu(self) -> None:
+            self.move_menu.delete(0, "end")
+            self.move_menu.add_command(
+                label="Sin carpeta", command=lambda: self.move_selected_vhost(None)
+            )
+            if self.groups:
+                self.move_menu.add_separator()
+            for group_name in sorted(self.groups, key=str.casefold):
+                self.move_menu.add_command(
+                    label=group_name,
+                    command=lambda name=group_name: self.move_selected_vhost(name),
+                )
+
+        def create_folder(self) -> None:
+            name = self.ask_folder_name()
+            if name is None:
+                return
+            name = name.strip()
+            if not name:
+                messagebox.showwarning(
+                    "Nombre vacío", "Escribe un nombre para la carpeta.", parent=self.root
+                )
+                return
+            if "\n" in name or "\r" in name:
+                messagebox.showwarning(
+                    "Nombre no válido",
+                    "El nombre de la carpeta no puede contener saltos de línea.",
+                    parent=self.root,
+                )
+                return
+            if name in self.groups:
+                messagebox.showwarning(
+                    "Carpeta existente", f"Ya existe la carpeta {name}.", parent=self.root
+                )
+                return
+            self.groups[name] = []
+            if self._save_groups():
+                self.reload()
+
+        def ask_folder_name(self) -> str | None:
+            """Show a Tk 8.6/9 compatible prompt without private macOS commands."""
+
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Nueva carpeta")
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+            result: dict[str, str | None] = {"value": None}
+            value = tk.StringVar()
+
+            frame = ttk.Frame(dialog, padding=18)
+            frame.pack(fill="both", expand=True)
+            ttk.Label(frame, text="Nombre de la carpeta de gestión:").pack(
+                anchor="w", pady=(0, 8)
+            )
+            entry = ttk.Entry(frame, textvariable=value, width=38)
+            entry.pack(fill="x")
+            actions = ttk.Frame(frame)
+            actions.pack(fill="x", pady=(16, 0))
+
+            def close() -> None:
+                dialog.destroy()
+
+            def accept() -> None:
+                result["value"] = value.get()
+                close()
+
+            ttk.Button(actions, text="Cancelar", command=close).pack(side="right")
+            ttk.Button(actions, text="Crear", command=accept).pack(
+                side="right", padx=(0, 8)
+            )
+            dialog.protocol("WM_DELETE_WINDOW", close)
+            dialog.bind("<Escape>", lambda _event: close())
+            dialog.bind("<Return>", lambda _event: accept())
+            dialog.grab_set()
+            entry.focus_set()
+            self.root.wait_window(dialog)
+            return result["value"]
+
+        def delete_folder(self) -> None:
+            selected = self.tree.selection()
+            if not selected or selected[0] not in self.folder_items:
+                return
+            name = self.folder_items[selected[0]]
+            if not messagebox.askyesno(
+                "Eliminar carpeta",
+                f"¿Eliminar la carpeta {name}?\n\nLos vhosts no se eliminarán; quedarán sin carpeta.",
+                parent=self.root,
+            ):
+                return
+            self.groups.pop(name, None)
+            if self._save_groups():
+                self.reload()
+
+        def move_selected_vhost(self, group_name: str | None) -> None:
+            selected = self.tree.selection()
+            if not selected:
+                return
+            record = self.records.get(selected[0])
+            if record is None:
+                return
+            assign_vhost_group(self.groups, record.name, group_name)
+            if self._save_groups():
+                self.editing_name = record.name
+                self.reload()
+
+        def open_selected_vhost(self, _event=None) -> None:
+            selected = self.tree.selection()
+            if selected and selected[0] in self.records:
+                self.notebook.tab(self.editor_tab, state="normal")
+                self.notebook.select(self.editor_tab)
+
         def reload(self) -> None:
             if not self._resolve_settings():
                 return
@@ -1320,17 +1729,45 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                 messagebox.showerror("No se pueden leer los vhosts", str(exc), parent=self.root)
                 return
             selected = self.editing_name
+            try:
+                self.groups = read_vhost_groups(self.groups_path)
+            except VhostManagerError as exc:
+                self.groups = {}
+                messagebox.showerror(
+                    "No se pueden leer las carpetas", str(exc), parent=self.root
+                )
             self.records = {}
+            self.folder_items = {}
             self.tree.delete(*self.tree.get_children())
+            group_nodes: dict[str, str] = {}
+            for index, group_name in enumerate(sorted(self.groups, key=str.casefold)):
+                item_id = f"folder-{index}"
+                group_nodes[group_name] = item_id
+                self.folder_items[item_id] = group_name
+                self.tree.insert(
+                    "", "end", iid=item_id, text=f"📁 {group_name}",
+                    values=("", "", "", "Carpeta"), open=True,
+                )
+            ungrouped_id = "folder-ungrouped"
+            self.tree.insert(
+                "", "end", iid=ungrouped_id, text="Sin carpeta",
+                values=("", "", "", ""), open=True,
+            )
+            assignments = {
+                member: group_name
+                for group_name, members in self.groups.items()
+                for member in members
+            }
             for index, record in enumerate(records):
                 item_id = f"vhost-{index}"
                 self.records[item_id] = record
+                parent = group_nodes.get(assignments.get(record.name), ungrouped_id)
                 item = self.tree.insert(
-                    "",
+                    parent,
                     "end",
                     iid=item_id,
+                    text=record.name,
                     values=(
-                        record.name,
                         record.port,
                         "Sí" if record.ssl else "No",
                         record.document_root,
@@ -1339,19 +1776,34 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                 )
                 if selected == record.name:
                     self.tree.selection_set(item)
+                    self.tree.see(item)
+            self._refresh_move_menu()
             self.status_var.set(
-                f"{len(records)} vhost(s) · {self.settings.vhosts_file}"
+                f"{len(records)} vhost(s) · {len(self.groups)} carpeta(s) · "
+                f"{self.settings.vhosts_file}"
             )
             if selected is None or not any(
                 record.name == selected for record in records
             ):
-                self.new_vhost(clear_selection=False)
+                self.editing_name = None
+                self.notebook.tab(self.editor_tab, state="disabled")
+                self.new_vhost(clear_selection=False, show_editor=False)
 
         def on_select(self, _event=None) -> None:
             selected = self.tree.selection()
             if not selected:
                 return
-            record = self.records[selected[0]]
+            item_id = selected[0]
+            record = self.records.get(item_id)
+            self.edit_button.configure(state="normal" if record else "disabled")
+            self.move_button.configure(state="normal" if record else "disabled")
+            self.delete_folder_button.configure(
+                state="normal" if item_id in self.folder_items else "disabled"
+            )
+            if record is None:
+                self.editing_name = None
+                self.notebook.tab(self.editor_tab, state="disabled")
+                return
             self.editing_name = record.name
             self.name_var.set(record.name)
             self.root_var.set(record.document_root)
@@ -1360,7 +1812,7 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
             self.ssl_var.set(record.ssl)
             self.cert_var.set(record.cert_name)
             self.map_var.set(False)
-            self._ssl_changed()
+            self._ssl_changed(update_port=False)
             self._set_editor_state(True, manual=not record.managed)
             if record.managed:
                 self.notice_var.set(
@@ -1371,20 +1823,21 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                     "Este bloque no fue creado por Vhost Manager. Se muestra en solo lectura para no sobrescribir configuración manual."
                 )
 
-        def new_vhost(self, clear_selection: bool = True) -> None:
+        def new_vhost(
+            self, clear_selection: bool = True, show_editor: bool = True
+        ) -> None:
             if clear_selection:
                 self.tree.selection_remove(self.tree.selection())
-            self.editing_name = None
-            self.name_var.set("")
-            self.root_var.set("")
-            self.alias_var.set("")
-            self.port_var.set("80")
-            self.ssl_var.set(False)
-            self.cert_var.set("")
-            self.map_var.set(True)
-            self._ssl_changed()
-            self._set_editor_state(True)
-            self.notice_var.set("Completa los datos para crear un vhost gestionado.")
+            self.new_name_var.set("")
+            self.new_root_var.set("")
+            self.new_alias_var.set("")
+            self.new_port_var.set("80")
+            self.new_ssl_var.set(False)
+            self.new_cert_var.set("")
+            self.new_map_var.set(True)
+            self._new_ssl_changed(update_port=False)
+            if show_editor:
+                self.notebook.select(self.new_tab)
 
         def _aliases(self) -> list[str]:
             return [
@@ -1392,6 +1845,49 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                 for value in re.split(r"[,\n]", self.alias_var.get())
                 if value.strip()
             ]
+
+        def _new_aliases(self) -> list[str]:
+            return [
+                value.strip()
+                for value in re.split(r"[,\n]", self.new_alias_var.get())
+                if value.strip()
+            ]
+
+        def save_new(self) -> None:
+            if not self._resolve_settings():
+                return
+            name = self.new_name_var.get().strip()
+            document_root = self.new_root_var.get().strip()
+            if not name or not document_root:
+                messagebox.showwarning(
+                    "Faltan datos",
+                    "ServerName y DocumentRoot son obligatorios.",
+                    parent=self.root,
+                )
+                return
+            try:
+                args = argparse.Namespace(
+                    name=name,
+                    document_root=document_root,
+                    alias=self._new_aliases(),
+                    port=valid_port(self.new_port_var.get().strip()),
+                    ssl=self.new_ssl_var.get(),
+                    cert_name=self.new_cert_var.get().strip() or None,
+                    map_host=self.new_map_var.get(),
+                    replace=False,
+                )
+                assert self.settings is not None
+                vhost_add(args, self.settings)
+                validate_and_reload_apache(self.settings)
+            except (VhostManagerError, OSError, argparse.ArgumentTypeError) as exc:
+                messagebox.showerror("No se pudo guardar", str(exc), parent=self.root)
+                return
+            self.new_vhost(clear_selection=False, show_editor=False)
+            self.reload()
+            self.notebook.select(self.list_tab)
+            messagebox.showinfo(
+                "Vhost guardado", f"{name} se ha creado correctamente.", parent=self.root
+            )
 
         def save(self) -> None:
             if not self._resolve_settings():
@@ -1424,6 +1920,7 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
                 )
                 assert self.settings is not None
                 vhost_add(args, self.settings)
+                validate_and_reload_apache(self.settings)
             except (VhostManagerError, OSError, argparse.ArgumentTypeError) as exc:
                 messagebox.showerror("No se pudo guardar", str(exc), parent=self.root)
                 return
@@ -1444,11 +1941,16 @@ def launch_gui(config_path: Path, config: dict[str, str]) -> None:
             try:
                 assert self.settings is not None
                 vhost_remove(argparse.Namespace(name=name), self.settings)
+                validate_and_reload_apache(self.settings)
             except (VhostManagerError, OSError) as exc:
                 messagebox.showerror("No se pudo eliminar", str(exc), parent=self.root)
                 return
+            assign_vhost_group(self.groups, name, None)
+            self._save_groups()
             self.editing_name = None
+            self.notebook.tab(self.editor_tab, state="disabled")
             self.reload()
+            self.notebook.select(self.list_tab)
 
         def test_apache(self) -> None:
             if not self._resolve_settings():
@@ -1652,7 +2154,7 @@ def dispatch(args: argparse.Namespace, config: dict[str, str]) -> None:
     elif subcommand == "test":
         run_apachectl(settings, "configtest")
     elif subcommand == "reload":
-        run_apachectl(settings, "-k", "graceful")
+        validate_and_reload_apache(settings)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

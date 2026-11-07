@@ -140,6 +140,21 @@ class VhostManagerTest(unittest.TestCase):
         self.assertTrue(records[0].managed)
         self.assertFalse(records[1].managed)
 
+    def test_persist_and_move_vhosts_between_management_folders(self):
+        groups_path = self.root / "groups.json"
+        groups = {"Clientes": ["alpha.test"], "Personal": []}
+
+        vhost_manager.assign_vhost_group(groups, "alpha.test", "Personal")
+        vhost_manager.assign_vhost_group(groups, "beta.test", "Clientes")
+        vhost_manager.write_vhost_groups(groups_path, groups)
+
+        loaded = vhost_manager.read_vhost_groups(groups_path)
+        self.assertEqual(loaded["Clientes"], ["beta.test"])
+        self.assertEqual(loaded["Personal"], ["alpha.test"])
+
+        vhost_manager.assign_vhost_group(loaded, "alpha.test", None)
+        self.assertNotIn("alpha.test", loaded["Personal"])
+
     def test_graphical_interface_is_the_default_command(self):
         with mock.patch.object(vhost_manager, "launch_web_gui") as launch_gui:
             status = vhost_manager.main(["--config", str(self.config)])
@@ -221,6 +236,32 @@ class VhostManagerTest(unittest.TestCase):
         self.assertTrue((self.certs / "generated.test.key").is_file())
 
     @unittest.skipUnless(shutil.which("openssl"), "openssl is not installed")
+    def test_openssl_fallback_generates_a_server_certificate(self):
+        original_which = shutil.which
+        with mock.patch.object(
+            vhost_manager.shutil,
+            "which",
+            side_effect=lambda name: None if name == "mkcert" else original_which(name),
+        ):
+            self.invoke("cert", "generate", "fallback.test")
+
+        result = vhost_manager.subprocess.run(
+            [
+                original_which("openssl"),
+                "x509",
+                "-in",
+                str(self.certs / "fallback.test.crt"),
+                "-noout",
+                "-text",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("CA:FALSE", result.stdout)
+        self.assertIn("TLS Web Server Authentication", result.stdout)
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is not installed")
     def test_ssl_vhost_generates_missing_certificate(self):
         output = self.invoke(
             "vhost",
@@ -233,7 +274,7 @@ class VhostManagerTest(unittest.TestCase):
             "--ssl",
         )
 
-        self.assertIn("Self-signed certificate generated", output)
+        self.assertIn("certificate generated", output)
         self.assertTrue((self.certs / "automatic.test.crt").is_file())
         self.assertTrue((self.certs / "automatic.test.key").is_file())
         self.assertIn("SSLCertificateFile", self.vhosts.read_text(encoding="utf-8"))
